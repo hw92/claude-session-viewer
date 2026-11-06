@@ -28,26 +28,9 @@ py $HOME\claude-session-viewer\session-viewer.py
 
 Your browser opens at http://127.0.0.1:8765/. The viewer keeps running in the background. Run the same command to open it again, including after a reboot.
 
-## Optional: a short command (Mac or Linux)
+## Custom install
 
-```
-mkdir -p ~/bin
-ln -s ~/claude-session-viewer/session-viewer.py ~/bin/session-viewer
-echo 'alias sv=session-viewer' >> ~/.zshrc
-```
-
-`~/bin` must be on your `PATH`. Then type `sv` in a new terminal.
-
-## Options
-
-| Command or setting | What it does |
-|---|---|
-| `--stop` | Stops the background viewer |
-| `--no-open` | Starts the viewer without opening a browser |
-| `--serve` | Runs the viewer in the foreground |
-| `SV_RESUME_CMD` | Command used by the "Copy resume command" button. Default: `claude` |
-
-The Windows resume command is written for PowerShell.
+To choose the folder, add a short command like `sv`, or change the resume button, see [CUSTOM-INSTALL.md](CUSTOM-INSTALL.md). You can follow it yourself or ask your Claude Code agent to do it for you.
 
 ## Privacy
 
