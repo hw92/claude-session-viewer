@@ -13,7 +13,7 @@ Set SV_RESUME_CMD to change the command in the resume button (default: claude).
 Index with searchable text: ~/.cache/cc-sessions/index.db (safe to delete, rebuilt on start).
 Binds to 127.0.0.1 only. Python stdlib only.
 """
-import base64, json, os, re, shlex, signal, sqlite3, subprocess, sys, threading, time, urllib.error, urllib.request, webbrowser
+import base64, bisect, collections, json, os, re, shlex, signal, sqlite3, subprocess, sys, threading, time, urllib.error, urllib.request, webbrowser
 from concurrent.futures import ProcessPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -35,6 +35,8 @@ NOISE = ("<local-command", "<task-notification", "<bash-stdout", "<bash-stderr",
 IMAGE_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
 REMINDER = re.compile(r"<(system-reminder|ide_opened_file|ide_selection)>.*?</\1>|</?pasted_content[^>]*>", re.S)
 progress = {"done": 0, "total": 0, "running": False}
+WORD = re.compile(r"[a-z][a-z0-9_-]{2,30}")
+vocab = {"words": None, "by": {}, "sorted": []}  # every word in the index, for typo matching
 
 
 # ---------- transcript parsing ----------
@@ -248,33 +250,85 @@ def scan_all():
     con.commit()
     con.close()
     progress["running"] = False
+    return len(todo) + len(gone)
 
 
 def scan_loop():
     while True:
         try:
-            scan_all()
+            if scan_all() or vocab["words"] is None:
+                build_vocab()
         except Exception as e:
             progress["running"] = False
             print("scan failed:", e, file=sys.stderr)
         time.sleep(RESCAN_SECONDS)
 
 
+def build_vocab():
+    con = connect()
+    cnt = collections.Counter()
+    for (t,) in con.execute("SELECT lower(title||' '||text) FROM sessions WHERE users>0"):
+        cnt.update(WORD.findall(t))
+    con.close()
+    by = {}
+    for w in cnt:
+        by.setdefault(w[0], []).append(w)
+    vocab.update(words=cnt, by=by, sorted=sorted(w for w, n in cnt.items() if n >= 3))
+
+
+def osa(a, b, k):
+    """Edit distance counting a swap of neighbors as one edit; returns k+1 once it passes k."""
+    prev2, prev = None, list(range(len(b) + 1))
+    for i in range(1, len(a) + 1):
+        cur = [i] + [0] * len(b)
+        for j in range(1, len(b) + 1):
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] != b[j - 1]))
+            if prev2 and j > 1 and a[i - 1] == b[j - 2] and a[i - 2] == b[j - 1]:
+                cur[j] = min(cur[j], prev2[j - 2] + 1)
+        if min(cur) > k:
+            return k + 1
+        prev2, prev = prev, cur
+    return prev[-1]
+
+
+def fuzzy(term):
+    """Up to 5 known words within 1-2 typos of term, or [] when term is already a common word or word start."""
+    k = 2 if len(term) >= 8 else 1 if len(term) >= 5 else 0
+    if not k or not WORD.fullmatch(term):
+        return []
+    if vocab["words"] is None:
+        build_vocab()
+    s = vocab["sorted"]
+    i = bisect.bisect_left(s, term)
+    if i < len(s) and s[i].startswith(term):
+        return []
+    words = vocab["words"]
+    near = [(osa(term, w, k), -words[w], w) for w in vocab["by"].get(term[0], ())
+            if w != term and words[w] >= 3 and abs(len(w) - len(term)) <= k]
+    return [w for d, _, w in sorted(x for x in near if x[0] <= k)[:5]]
+
+
 COLS = "key,id,path,title,renamed,cwd,first,last,prompt,users,replies,compacts,size"
 
 
 def list_sessions(q):
+    """Sessions containing every term; a misspelled term also matches its closest real words."""
     con = connect()
     terms = q.lower().split()
+    near = {t: v for t in terms if (v := fuzzy(t))}
     if terms:
-        where = " AND ".join(["instr(lower(title||' '||text),?)>0"] * len(terms))
+        groups = [[t, *near.get(t, [])] for t in terms]
+        has = "instr(lower(title||' '||text),?)>0"
+        where = " AND ".join("(" + " OR ".join([has] * len(g)) + ")" for g in groups)
+        at = ",".join(["nullif(instr(lower(text),?),0)"] * len(groups[0]))
         rows = con.execute(
-            f"SELECT {COLS}, substr(text,max(instr(lower(text),?)-60,1),190) AS snippet FROM sessions "
-            f"WHERE users>0 AND {where} ORDER BY last DESC LIMIT 300", [terms[0], *terms]).fetchall()
+            f"SELECT {COLS}, substr(text,max(coalesce({at},1)-60,1),190) AS snippet FROM sessions "
+            f"WHERE users>0 AND {where} ORDER BY last DESC LIMIT 300",
+            [*groups[0], *(x for g in groups for x in g)]).fetchall()
     else:
         rows = con.execute(f"SELECT {COLS} FROM sessions WHERE users>0 ORDER BY last DESC").fetchall()
     con.close()
-    return [dict(r) for r in rows]
+    return [dict(r) for r in rows], near
 
 
 def lookup(key):
@@ -315,7 +369,8 @@ class Handler(BaseHTTPRequestHandler):
             if url.path == "/":
                 return self.send(PAGE.encode(), "text/html; charset=utf-8")
             if url.path == "/api/sessions":
-                return self.json({"sessions": list_sessions(qs.get("q", "")), "progress": progress})
+                rows, near = list_sessions(qs.get("q", ""))
+                return self.json({"sessions": rows, "fuzzy": near, "progress": progress})
             row = lookup(qs.get("key", ""))
             if not row:
                 return self.send(b"not found", "text/plain", 404)
@@ -370,7 +425,11 @@ def main():
             except ProcessLookupError:
                 pass
             PID.unlink()
-        return print("stopped")
+        for _ in range(10):
+            if not running():
+                return print("stopped")
+            time.sleep(0.2)
+        return print(f"still running on port {PORT}; stop that process yourself", file=sys.stderr)
     if not running():
         CACHE.mkdir(parents=True, exist_ok=True)
         with open(CACHE / "server.log", "a") as log:
@@ -402,6 +461,11 @@ aside{background:var(--panel);display:flex;flex-direction:column;min-height:0;he
 input,select{width:100%;padding:7px 9px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--ink);font:inherit}
 input:focus,select:focus{outline:2px solid var(--accent);outline-offset:-1px}
 #status{font-size:12px;color:var(--dim)}
+#fbox{position:relative}#fq.set{border-color:var(--accent);font-weight:600}
+#fmenu{position:absolute;left:0;right:0;top:calc(100% + 3px);max-height:65vh;overflow-y:auto;background:var(--bg);border:1px solid var(--line);border-radius:6px;z-index:5;box-shadow:0 6px 20px rgba(0,0,0,.18)}
+.fi{display:flex;gap:8px;align-items:baseline;padding:5px 9px;cursor:pointer}.fi.on{background:var(--sel)}
+.fi b{font-weight:600;white-space:nowrap}.fi small{color:var(--dim);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}.fi i{color:var(--dim);font-size:12px;font-style:normal}
+#head .cwd{cursor:pointer;text-decoration:underline dotted}
 #list{overflow-y:auto;flex:1}
 .day{position:sticky;top:0;background:var(--panel);padding:10px 12px 4px;font-size:12px;font-weight:600;color:var(--dim);z-index:1}
 .row{display:block;width:100%;text-align:left;border:0;background:none;color:inherit;font:inherit;padding:7px 12px;cursor:pointer;border-left:3px solid transparent}
@@ -437,7 +501,7 @@ details.one label{display:block;margin:6px 0 2px;font-size:11px;font-weight:600}
 </style></head><body>
 <aside id="left"><div id="controls">
 <input id="q" type="search" placeholder="Search all sessions  ( / )" autocomplete="off">
-<select id="folder"></select><div id="status"></div></div><div id="list"></div></aside>
+<div id="fbox"><input id="fq" type="search" placeholder="Filter by folder  ( f )" autocomplete="off" spellcheck="false"><div id="fmenu" hidden></div></div><div id="status"></div></div><div id="list"></div></aside>
 <main id="main"><div id="head" hidden></div><div id="body"><div class="empty">Pick a session on the left.</div></div></main>
 <aside id="outline"></aside>
 <script>
@@ -474,19 +538,30 @@ function md(src){const L=src.split('\n'),o=[];let i=0;
     o.push('<p>'+b.join('<br>')+'</p>')}
   return o.join('')}
 
-let all=[],currentKey=null,query='',lastSig='';
+let all=[],currentKey=null,query='',lastSig='',near={};
 async function loadList(){
   const r=await(await fetch('/api/sessions?q='+encodeURIComponent(query))).json();
   const sig=r.sessions.map(s=>s.key+s.last+s.title).join();
   if(sig!==lastSig){lastSig=sig;all=r.sessions;fillFolders();renderList()}
-  const p=r.progress;$('status').textContent=(p.running?`Indexing ${p.done} of ${p.total} changed files. `:'')+counts();
+  near=r.fuzzy||{};const p=r.progress;$('status').textContent=(p.running?`Indexing ${p.done} of ${p.total} changed files. `:'')+counts();
   clearTimeout(loadList.t);loadList.t=setTimeout(loadList,p.running?2000:30000)}
-function visible(){const f=$('folder').value;return f?all.filter(s=>s.cwd===f):all}
-function counts(){const v=visible(),n=v.length;return `${n}${query&&n===300?'+':''} session${n===1?'':'s'}${query?' match':''}`}
-function fillFolders(){const keep=$('folder').value,c={};all.forEach(s=>c[s.cwd]=(c[s.cwd]||0)+1);
-  const names=Object.keys(c).sort((a,b)=>c[b]-c[a]);
-  $('folder').innerHTML='<option value="">All folders</option>'+names.map(n=>`<option value="${esc(n)}">${esc(home(n))} (${c[n]})</option>`).join('');
-  $('folder').value=names.includes(keep)?keep:''}
+let folder='',folders=[],fpick=[],fsel=0;
+function visible(){return folder?all.filter(s=>s.cwd===folder):all}
+function counts(){const v=visible(),n=v.length,f=Object.entries(near).map(([t,w])=>`${t} → ${w.join(', ')}`).join('; ');
+  return `${n}${query&&n===300?'+':''} session${n===1?'':'s'}${query?' match':''}${f?'. Also matching '+f:''}`}
+function fillFolders(){const c={};for(const s of all){const f=c[s.cwd]||(c[s.cwd]={cwd:s.cwd,n:0,last:''});f.n++;if(s.last>f.last)f.last=s.last}
+  folders=Object.values(c).sort((a,b)=>a.last<b.last?1:-1);if(!$('fmenu').hidden)showFolders()}
+// Folder picker: every typed word must appear in the path; most recently used first.
+function showFolders(){const typed=$('fq').classList.contains('set')?'':$('fq').value.toLowerCase(),terms=typed.split(/\s+/).filter(Boolean);
+  fpick=folders.filter(f=>{const p=home(f.cwd).toLowerCase();return terms.every(t=>p.includes(t))}).slice(0,80);
+  if(terms.length){const t=terms[terms.length-1];fpick.sort((a,b)=>(base(b.cwd).toLowerCase().includes(t))-(base(a.cwd).toLowerCase().includes(t)))}
+  fsel=Math.min(fsel,Math.max(fpick.length-1,0));
+  $('fmenu').innerHTML=(terms.length?'':`<div class="fi${fsel===-1?' on':''}" data-i="-1"><b>All folders</b><small></small><i>${all.length}</i></div>`)+
+    fpick.map((f,i)=>`<div class="fi${i===fsel?' on':''}" data-i="${i}"><b>${esc(base(f.cwd))}</b><small>${esc(home(f.cwd).slice(0,-base(f.cwd).length).replace(/[\\/]$/,''))}</small><i>${f.n}</i></div>`).join('')||'<div class="fi"><small>No folder matches.</small></div>';
+  $('fmenu').hidden=false;$('fmenu').querySelector('.fi.on')?.scrollIntoView({block:'nearest'})}
+const base=p=>(p||'').split(/[\\/]/).filter(Boolean).pop()||p;
+function setFolder(cwd){folder=cwd||'';const q=$('fq');q.value=folder?home(folder):'';q.classList.toggle('set',!!folder);q.title=folder;
+  $('fmenu').hidden=true;renderList();$('status').textContent=counts();$('list').scrollTop=0}
 function renderList(){let h='',day='';
   for(const s of visible()){const d=dayName(s.last);if(d!==day){day=d;h+=`<div class="day">${esc(d)}</div>`}
     const c=s.compacts?` · compacted ${s.compacts}x`:'';
@@ -505,8 +580,9 @@ async function openSession(key){currentKey=key;renderList();
   if(key!==currentKey)return;
   const zone=new Intl.DateTimeFormat('en-US',{timeZoneName:'short'}).formatToParts(new Date(s.last)).find(x=>x.type==='timeZoneName').value;
   const span=`${clock(s.first)} to ${clock(s.last)} ${zone}`;
-  $('head').innerHTML=`<h1>${esc(s.title)}</h1><p>${esc(home(s.cwd))} · ${esc(span)} · ${s.users} prompts · ${s.compacts} compactions · ${(s.size/1048576).toFixed(1)} MB</p><div class="btns"></div>`;
+  $('head').innerHTML=`<h1>${esc(s.title)}</h1><p><span class="cwd" title="Show only this folder">${esc(home(s.cwd))}</span> · ${esc(span)} · ${s.users} prompts · ${s.compacts} compactions · ${(s.size/1048576).toFixed(1)} MB</p><div class="btns"></div>`;
   $('head').querySelector('.btns').append(copyBtn('Copy resume command',s.resume),copyBtn('Copy jsonl path',s.path));
+  $('head').querySelector('.cwd').onclick=()=>setFolder(s.cwd);
   $('head').hidden=false;renderBody(s,items);$('main').scrollTop=0;jumpToHit()}
 function renderBody(s,items){const body=$('body'),out=[];body.innerHTML='';let day='',group=null,n=0;
   const add=(el,ts)=>{group=null;const d=ts&&dayKey(ts);if(d&&d!==day){day=d;const x=document.createElement('div');x.className='date';x.textContent=dayName(ts);body.append(x)}body.append(el);return el};
@@ -534,7 +610,7 @@ function toolEl(t){const d=document.createElement('details');d.className='one'+(
   d.innerHTML=t.k==='thinking'?'<summary><b>Thinking</b></summary>':`<summary><b>${esc(t.name)}</b> ${esc(t.hint)}</summary>`;
   d.addEventListener('toggle',function(){if(!this.open||this.done)return;this.done=1;
     this.insertAdjacentHTML('beforeend',t.k==='thinking'?`<pre>${esc(t.out)}</pre>`:`<label>Input</label><pre>${esc(t.in)}</pre><label>Output</label><pre>${esc(t.out||'(none)')}</pre>`)});return d}
-function jumpToHit(){const terms=query.trim().split(/\s+/).filter(Boolean);if(!terms.length)return;
+function jumpToHit(){const terms=query.trim().split(/\s+/).filter(Boolean).flatMap(t=>[t,...(near[t.toLowerCase()]||[])]);if(!terms.length)return;
   const re=new RegExp(terms.map(t=>t.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')).join('|'),'gi'),nodes=[];
   const w=document.createTreeWalker($('body'),NodeFilter.SHOW_TEXT);while(w.nextNode()){if(!w.currentNode.parentElement.closest('details')&&!w.currentNode.parentElement.closest('time'))nodes.push(w.currentNode)}
   let first=null;for(const n of nodes){const v=n.nodeValue;re.lastIndex=0;if(!re.test(v))continue;re.lastIndex=0;
@@ -543,8 +619,18 @@ function jumpToHit(){const terms=query.trim().split(/\s+/).filter(Boolean);if(!t
   if(first)first.scrollIntoView({block:'center'})}
 
 let timer;$('q').addEventListener('input',e=>{clearTimeout(timer);timer=setTimeout(()=>{query=e.target.value;lastSig='';loadList()},250)});
-$('folder').onchange=()=>{renderList();$('status').textContent=counts()};
-addEventListener('keydown',e=>{if(e.key==='/'&&!/INPUT|SELECT/.test(document.activeElement.tagName)){e.preventDefault();$('q').focus()}});
+const fq=$('fq');
+fq.addEventListener('focus',()=>{fsel=0;showFolders();if(fq.classList.contains('set'))fq.select()});
+fq.addEventListener('input',()=>{fq.classList.remove('set');fsel=0;if(!fq.value&&folder){folder='';renderList();$('status').textContent=counts()}showFolders()});
+fq.addEventListener('blur',()=>setTimeout(()=>{$('fmenu').hidden=true;if(!fq.classList.contains('set'))fq.value=folder?home(folder):'';fq.classList.toggle('set',!!folder)},120));
+fq.addEventListener('keydown',e=>{const top=$('fq').value.trim()?0:-1;
+  if(e.key==='ArrowDown'){e.preventDefault();fsel=Math.min(fsel+1,fpick.length-1);showFolders()}
+  else if(e.key==='ArrowUp'){e.preventDefault();fsel=Math.max(fsel-1,top);showFolders()}
+  else if(e.key==='Enter'){e.preventDefault();setFolder(fsel===-1?'':fpick[fsel]?.cwd||folder);fq.blur()}
+  else if(e.key==='Escape'){e.preventDefault();setFolder('');fq.blur()}});
+$('fmenu').addEventListener('mousedown',e=>{const d=e.target.closest('.fi[data-i]');if(!d)return;e.preventDefault();const i=+d.dataset.i;setFolder(i<0?'':fpick[i].cwd);fq.blur()});
+addEventListener('keydown',e=>{if(/INPUT|SELECT|TEXTAREA/.test(document.activeElement.tagName))return;
+  if(e.key==='/'){e.preventDefault();$('q').focus()}else if(e.key==='f'&&!e.metaKey&&!e.ctrlKey){e.preventDefault();fq.focus()}});
 addEventListener('hashchange',route);
 function route(){const k=decodeURIComponent(location.hash.slice(1));if(k&&k!==currentKey)openSession(k)}
 loadList().then(route);
