@@ -7,6 +7,10 @@ model sees; the original messages stay in the file, so this shows all of them.
     session-viewer            start the server in the background if needed, open the browser
     session-viewer --serve    run the server in the foreground
     session-viewer --stop     stop the background server
+    session-viewer find "words" [--since 7d] [--folder X] [--role R] [--type T] [--limit N] [--json]
+                              find sessions; ranks summaries (from summarize.py) and full text together
+    session-viewer show <session id, id prefix or key> [--grep word] [--max N]
+                              print one session as plain text: your messages and Claude's replies
 
 Set SV_RESUME_CMD to change the command in the resume button (default: claude).
 Set SV_TRASH to a folder to turn on the Move to trash button (off by default).
@@ -538,7 +542,163 @@ def running():
     return True
 
 
+# ---------- command line: find / show ----------
+
+def local_time(ts):
+    from datetime import datetime
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone().strftime("%Y-%m-%d %H:%M %Z")
+    except ValueError:
+        return ts[:16]
+
+
+def since_iso(v):
+    """'7d', '2w', '3m' or 'YYYY-MM-DD' -> UTC ISO string to compare with timestamps."""
+    from datetime import datetime, timedelta, timezone
+    m = re.fullmatch(r"(\d+)([dwm])", v or "")
+    if m:
+        days = int(m.group(1)) * {"d": 1, "w": 7, "m": 30}[m.group(2)]
+        return (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M")
+    return v or ""
+
+
+def summary_rows():
+    if not SUMMARIES.exists():
+        return {}
+    con = sqlite3.connect(SUMMARIES, timeout=30)
+    con.row_factory = sqlite3.Row
+    rows = {r["key"]: dict(r) for r in con.execute("SELECT * FROM summaries")}
+    con.close()
+    return rows
+
+
+def summary_ranking(q, sums, near):
+    """Keys whose title, summary or keywords match ANY query word (or phrase), best first."""
+    con = sqlite3.connect(":memory:")
+    con.execute("CREATE VIRTUAL TABLE f USING fts5(key UNINDEXED, title, summary, keywords, "
+                "tokenize='unicode61 remove_diacritics 2')")
+    con.executemany("INSERT INTO f VALUES(?,?,?,?)",
+                    [(k, r["title"], r["summary"], " ".join(json.loads(r["keywords"] or "[]"))) for k, r in sums.items()])
+    parts = [p for p in fts_query(q, near).split(" AND ") if p]
+    if not parts:
+        return []
+    return [r[0] for r in con.execute("SELECT key FROM f WHERE f MATCH ? ORDER BY bm25(f, 3.0, 2.0, 2.0) LIMIT 60",
+                                      [" OR ".join(parts)])]
+
+
+def find(q, since="", folder="", role="", kind="", limit=10):
+    """Rank sessions by summary match and full-text match together (reciprocal rank fusion)."""
+    init_db()
+    scan_all()
+    sums = summary_rows()
+    score = {}
+    if q.strip():
+        rows, near = list_sessions(q, "rank")
+        if not CJK.search(q):
+            for i, k in enumerate(summary_ranking(q, sums, near)):
+                score[k] = score.get(k, 0) + 1.5 / (60 + i)
+        for i, r in enumerate(rows[:60]):
+            score[r["key"]] = score.get(r["key"], 0) + 1 / (60 + i)
+        keys = sorted(score, key=score.get, reverse=True)
+    else:
+        con = connect()
+        keys = [r[0] for r in con.execute("SELECT key FROM sessions WHERE users>0 ORDER BY last DESC")]
+        con.close()
+    cut, out = since_iso(since), []
+    for k in keys:
+        row = lookup(k)
+        if not row:
+            continue
+        sm = sums.get(k, {})
+        if (cut and row["last"] < cut) or (folder and folder.lower() not in row["cwd"].lower()) \
+                or (role and sm.get("role") != role) or (kind and sm.get("type") != kind):
+            continue
+        out.append({"id": row["id"], "key": k, "title": row["title"], "folder": row["cwd"],
+                    "first": row["first"], "last": row["last"], "prompts": row["users"],
+                    "role": sm.get("role", ""), "type": sm.get("type", ""), "summary": sm.get("summary", ""),
+                    "keywords": json.loads(sm.get("keywords") or "[]"), "resume": resume_line(row["cwd"], row["id"]),
+                    "jsonl": row["path"]})
+        if len(out) >= limit:
+            break
+    return out
+
+
+def resolve(ref):
+    """Session row from a key, a full session id, or an id prefix of 6+ characters."""
+    row = lookup(ref)
+    if row or len(ref) < 6:
+        return row
+    con = connect()
+    hits = con.execute("SELECT key FROM sessions WHERE id LIKE ? ORDER BY last DESC", (ref + "%",)).fetchall()
+    con.close()
+    return lookup(hits[0][0]) if len(hits) == 1 else None
+
+
+def show(ref, grep="", max_chars=40000):
+    init_db()
+    scan_all()
+    row = resolve(ref)
+    if not row:
+        return print(f"no session matches {ref!r}", file=sys.stderr)
+    sm = summary_rows().get(row["key"], {})
+    print(f"# {row['title']}\nfolder: {row['cwd']}\ntime: {local_time(row['first'])} to {local_time(row['last'])}"
+          f"\nresume: {resume_line(row['cwd'], row['id'])}\njsonl: {row['path']}")
+    if sm:
+        print(f"summary: {sm['summary']}\nkeywords: {', '.join(json.loads(sm['keywords']))}")
+    blocks = []
+    for it in load_session(row["path"]):
+        if it["k"] == "user" and it["text"]:
+            blocks.append(f"[{local_time(it['ts'])}] USER: {it['text']}")
+        elif it["k"] == "assistant":
+            blocks.append(f"CLAUDE: {it['text']}")
+        elif it["k"] == "compact":
+            blocks.append(f"[{local_time(it['ts'])}] --- compacted here ---")
+    if grep:
+        g = grep.lower()
+        blocks = [b for b in blocks if g in b.lower()]
+        print(f"({len(blocks)} messages contain {grep!r})")
+    text = "\n\n".join(blocks)
+    if len(text) > max_chars:
+        half = max_chars // 2
+        text = text[:half] + f"\n\n[... {len(text) - max_chars:,} chars skipped; use --grep or --max ...]\n\n" + text[-half:]
+    print("\n" + text)
+
+
+def cli(argv):
+    import argparse
+    ap = argparse.ArgumentParser(prog="session-viewer")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    f = sub.add_parser("find", help="find sessions")
+    f.add_argument("query", nargs="?", default="")
+    f.add_argument("--since", default="", help="7d, 2w, 3m or YYYY-MM-DD")
+    f.add_argument("--folder", default="", help="part of the folder path")
+    f.add_argument("--role", default="")
+    f.add_argument("--type", default="")
+    f.add_argument("--limit", type=int, default=10)
+    f.add_argument("--json", action="store_true")
+    s = sub.add_parser("show", help="print one session as text")
+    s.add_argument("ref", help="session id, id prefix (6+ chars) or key")
+    s.add_argument("--grep", default="")
+    s.add_argument("--max", type=int, default=40000)
+    a = ap.parse_args(argv)
+    if a.cmd == "show":
+        return show(a.ref, a.grep, a.max)
+    res = find(a.query, a.since, a.folder, a.role, a.type, a.limit)
+    if a.json:
+        return print(json.dumps(res, indent=1, ensure_ascii=False))
+    if not res:
+        return print("no sessions found")
+    for i, r in enumerate(res, 1):
+        tag = f"  [{r['role']}/{r['type']}]" if r["role"] else ""
+        print(f"{i}. {local_time(r['last'])}  {r['folder']}{tag}\n   {r['title']}")
+        if r["summary"]:
+            print(f"   {r['summary']}\n   keywords: {', '.join(r['keywords'])}")
+        print(f"   resume: {r['resume']}\n")
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] in ("find", "show"):
+        return cli(sys.argv[1:])
     url = f"http://127.0.0.1:{PORT}/"
     if "--serve" in sys.argv:
         return serve()

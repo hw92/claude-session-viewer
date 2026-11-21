@@ -53,4 +53,10 @@ Open a session and click **☆ Favorite** in its header to star it; starred sess
 
 With `SV_TRASH` set (here `~/trash-box`, set in `~/.zshrc`), each session header has **Move to trash**. Click it, then click again within 4 seconds to confirm. The session's `.jsonl` and its subagent folder move to `~/trash-box/<date>-session-viewer/`, a row is added to `~/trash-box/_manifest.md`, and the session leaves the index, favorites and summaries. Sessions changed in the last 10 minutes are refused, since Claude Code may still be writing them.
 
+## Find and show (command line and skill)
+
+- `session-viewer find "words" [--since 7d] [--folder X] [--role R] [--type T] [--limit N] [--json]` ranks sessions by summary match (any word, title and keywords weighted up) and full-text match (all words) together, using reciprocal rank fusion. No words plus `--since` lists recent sessions.
+- `session-viewer show <id | 6+ char id prefix | key> [--grep word] [--max N]` prints the header (folder, times, resume command, summary) and the messages, without tool output.
+- The `find-session` skill (`skills/find-session/SKILL.md`, linked into `~/.claude/skills/`) makes Claude turn a vague memory into 2-3 keyword searches, pick the right session, and answer with the resume command. Tested in a fresh `claude -p` session from `~`: "the session where I built a central place for agent API keys" found the right session and gave the resume line.
+
 *Written by Hai & Claude (claude-opus-5-5) | 2026-11-21 15:06 ET*
