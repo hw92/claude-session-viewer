@@ -216,6 +216,17 @@ def init_db():
     con.execute("""CREATE TABLE IF NOT EXISTS sessions(
         key TEXT PRIMARY KEY, id TEXT, path TEXT, mtime REAL, size INTEGER, title TEXT, renamed INTEGER,
         cwd TEXT, first TEXT, last TEXT, prompt TEXT, users INTEGER, replies INTEGER, compacts INTEGER, text TEXT)""")
+    # Word index over title and text for ranked search; it reads the text from the sessions table.
+    new = not con.execute("SELECT 1 FROM sqlite_master WHERE name='fts'").fetchone()
+    con.executescript("""
+        CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(title, text, content='sessions', content_rowid='rowid',
+            tokenize='unicode61 remove_diacritics 2');
+        CREATE TRIGGER IF NOT EXISTS fts_add AFTER INSERT ON sessions BEGIN
+            INSERT INTO fts(rowid, title, text) VALUES (new.rowid, new.title, new.text); END;
+        CREATE TRIGGER IF NOT EXISTS fts_del AFTER DELETE ON sessions BEGIN
+            INSERT INTO fts(fts, rowid, title, text) VALUES ('delete', old.rowid, old.title, old.text); END;""")
+    if new:
+        con.execute("INSERT INTO fts(fts) VALUES ('rebuild')")
     con.commit()
     con.close()
 
@@ -239,7 +250,8 @@ def scan_all():
         with ProcessPoolExecutor(max(2, (os.cpu_count() or 4) - 2)) as pool:
             for s in pool.map(scan_file, todo, chunksize=4):
                 p = Path(s["path"])
-                con.execute("INSERT OR REPLACE INTO sessions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+                con.execute("DELETE FROM sessions WHERE key=?", (f"{p.parent.name}/{p.stem}",))
+                con.execute("INSERT INTO sessions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
                     f"{p.parent.name}/{p.stem}", p.stem, s["path"], s["mtime"], s["size"],
                     s["custom"] or s["ai"] or s["prompt"][:90] or "(untitled)", int(bool(s["custom"])),
                     s["cwd"] or p.parent.name, s["first"], s["last"], s["prompt"],
@@ -311,12 +323,44 @@ def fuzzy(term):
 COLS = "key,id,path,title,renamed,cwd,first,last,prompt,users,replies,compacts,size"
 
 
-def list_sessions(q):
-    """Sessions containing every term; a misspelled term also matches its closest real words."""
+CJK = re.compile(r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af\uf900-\ufaff]")
+QUERY = re.compile(r'"([^"]*)"|(\S+)')
+
+
+def fts_query(q, near):
+    """FTS5 MATCH string. A plain word matches words starting with it (sess -> session); "quoted" text matches
+    exactly; a misspelled word is ORed with its closest real words."""
+    parts = []
+    for phrase, word in QUERY.findall(q.lower()):
+        text = (phrase or word).rstrip("*")
+        if not re.search(r"\w", text):
+            continue
+        quoted = '"' + text.replace('"', '""') + '"'
+        if phrase:
+            parts.append(quoted)
+        elif word.endswith("*"):
+            parts.append(quoted + "*")
+        else:
+            parts.append("(" + " OR ".join([quoted + "*", *('"' + v + '"' for v in near.get(text, []))]) + ")")
+    return " AND ".join(parts)
+
+
+def list_sessions(q, sort="new"):
+    """Ranked word search, falling back to substring search for Chinese/Japanese/Korean or when words find nothing.
+    A misspelled term also matches its closest real words."""
     con = connect()
-    terms = q.lower().split()
+    terms = [t.strip('"*') for t in q.lower().split() if t.strip('"*')]
     near = {t: v for t in terms if (v := fuzzy(t))}
-    if terms:
+    rows = []
+    match = "" if CJK.search(q) else fts_query(q, near)
+    if match:
+        order = "bm25(fts, 5.0, 1.0)" if sort == "rank" else "s.last DESC"
+        cols = ",".join("s." + c for c in COLS.split(","))
+        rows = con.execute(
+            f"SELECT {cols}, snippet(fts, -1, char(2), char(3), '...', 28) AS snippet FROM fts "
+            f"JOIN sessions s ON s.rowid = fts.rowid WHERE fts MATCH ? AND s.users>0 ORDER BY {order} LIMIT 300",
+            [match]).fetchall()
+    if terms and not rows:
         groups = [[t, *near.get(t, [])] for t in terms]
         has = "instr(lower(title||' '||text),?)>0"
         where = " AND ".join("(" + " OR ".join([has] * len(g)) + ")" for g in groups)
@@ -325,7 +369,7 @@ def list_sessions(q):
             f"SELECT {COLS}, substr(text,max(coalesce({at},1)-60,1),190) AS snippet FROM sessions "
             f"WHERE users>0 AND {where} ORDER BY last DESC LIMIT 300",
             [*groups[0], *(x for g in groups for x in g)]).fetchall()
-    else:
+    elif not terms:
         rows = con.execute(f"SELECT {COLS} FROM sessions WHERE users>0 ORDER BY last DESC").fetchall()
     con.close()
     return [dict(r) for r in rows], near
@@ -369,7 +413,7 @@ class Handler(BaseHTTPRequestHandler):
             if url.path == "/":
                 return self.send(PAGE.encode(), "text/html; charset=utf-8")
             if url.path == "/api/sessions":
-                rows, near = list_sessions(qs.get("q", ""))
+                rows, near = list_sessions(qs.get("q", ""), qs.get("sort", "new"))
                 return self.json({"sessions": rows, "fuzzy": near, "progress": progress})
             row = lookup(qs.get("key", ""))
             if not row:
@@ -460,7 +504,8 @@ aside{background:var(--panel);display:flex;flex-direction:column;min-height:0;he
 #controls{padding:12px;display:grid;gap:8px;border-bottom:1px solid var(--line)}
 input,select{width:100%;padding:7px 9px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--ink);font:inherit}
 input:focus,select:focus{outline:2px solid var(--accent);outline-offset:-1px}
-#status{font-size:12px;color:var(--dim)}
+#status{font-size:12px;color:var(--dim);flex:1}#srow{display:flex;gap:8px;align-items:flex-start}
+#sort{width:auto;padding:1px 4px;font-size:12px}
 #fbox{position:relative}#fq.set{border-color:var(--accent);font-weight:600}
 #fmenu{position:absolute;left:0;right:0;top:calc(100% + 3px);max-height:65vh;overflow-y:auto;background:var(--bg);border:1px solid var(--line);border-radius:6px;z-index:5;box-shadow:0 6px 20px rgba(0,0,0,.18)}
 .fi{display:flex;gap:8px;align-items:baseline;padding:5px 9px;cursor:pointer}.fi.on{background:var(--sel)}
@@ -501,7 +546,7 @@ details.one label{display:block;margin:6px 0 2px;font-size:11px;font-weight:600}
 </style></head><body>
 <aside id="left"><div id="controls">
 <input id="q" type="search" placeholder="Search all sessions  ( / )" autocomplete="off">
-<div id="fbox"><input id="fq" type="search" placeholder="Filter by folder  ( f )" autocomplete="off" spellcheck="false"><div id="fmenu" hidden></div></div><div id="status"></div></div><div id="list"></div></aside>
+<div id="fbox"><input id="fq" type="search" placeholder="Filter by folder  ( f )" autocomplete="off" spellcheck="false"><div id="fmenu" hidden></div></div><div id="srow"><div id="status"></div><select id="sort" title="Order of search results" hidden><option value="new">Newest</option><option value="rank">Best match</option></select></div></div><div id="list"></div></aside>
 <main id="main"><div id="head" hidden></div><div id="body"><div class="empty">Pick a session on the left.</div></div></main>
 <aside id="outline"></aside>
 <script>
@@ -540,7 +585,7 @@ function md(src){const L=src.split('\n'),o=[];let i=0;
 
 let all=[],currentKey=null,query='',lastSig='',near={};
 async function loadList(){
-  const r=await(await fetch('/api/sessions?q='+encodeURIComponent(query))).json();
+  const r=await(await fetch('/api/sessions?q='+encodeURIComponent(query)+'&sort='+$('sort').value)).json();$('sort').hidden=!query.trim();
   const sig=r.sessions.map(s=>s.key+s.last+s.title).join();
   if(sig!==lastSig){lastSig=sig;all=r.sessions;fillFolders();renderList()}
   near=r.fuzzy||{};const p=r.progress;$('status').textContent=(p.running?`Indexing ${p.done} of ${p.total} changed files. `:'')+counts();
@@ -562,10 +607,10 @@ function showFolders(){const typed=$('fq').classList.contains('set')?'':$('fq').
 const base=p=>(p||'').split(/[\\/]/).filter(Boolean).pop()||p;
 function setFolder(cwd){folder=cwd||'';const q=$('fq');q.value=folder?home(folder):'';q.classList.toggle('set',!!folder);q.title=folder;
   $('fmenu').hidden=true;renderList();$('status').textContent=counts();$('list').scrollTop=0}
-function renderList(){let h='',day='';
-  for(const s of visible()){const d=dayName(s.last);if(d!==day){day=d;h+=`<div class="day">${esc(d)}</div>`}
+function renderList(){let h='',day='';const ranked=query.trim()&&$('sort').value==='rank';
+  for(const s of visible()){const d=dayName(s.last);if(!ranked&&d!==day){day=d;h+=`<div class="day">${esc(d)}</div>`}
     const c=s.compacts?` · compacted ${s.compacts}x`:'';
-    h+=`<button class="row${s.key===currentKey?' on':''}" data-k="${esc(s.key)}"><b>${esc(s.title)}</b><small>${esc(clock(s.last))} · ${esc(home(s.cwd))} · ${s.users} prompts${c}</small>${s.snippet?`<small class="snip">${esc(s.snippet.replace(/\s+/g,' '))}</small>`:''}</button>`}
+    h+=`<button class="row${s.key===currentKey?' on':''}" data-k="${esc(s.key)}"><b>${esc(s.title)}</b><small>${esc(clock(s.last))} · ${esc(home(s.cwd))} · ${s.users} prompts${c}</small>${s.snippet?`<small class="snip">${esc(s.snippet.replace(/\s+/g,' ')).replace(/\x02/g,'<mark>').replace(/\x03/g,'</mark>')}</small>`:''}</button>`}
   $('list').innerHTML=h||'<div class="empty">No sessions.</div>';
   $('list').querySelectorAll('.row').forEach(b=>b.onclick=()=>{if(b.dataset.k===currentKey)openSession(currentKey);else location.hash=encodeURIComponent(b.dataset.k)})}
 
@@ -610,7 +655,7 @@ function toolEl(t){const d=document.createElement('details');d.className='one'+(
   d.innerHTML=t.k==='thinking'?'<summary><b>Thinking</b></summary>':`<summary><b>${esc(t.name)}</b> ${esc(t.hint)}</summary>`;
   d.addEventListener('toggle',function(){if(!this.open||this.done)return;this.done=1;
     this.insertAdjacentHTML('beforeend',t.k==='thinking'?`<pre>${esc(t.out)}</pre>`:`<label>Input</label><pre>${esc(t.in)}</pre><label>Output</label><pre>${esc(t.out||'(none)')}</pre>`)});return d}
-function jumpToHit(){const terms=query.trim().split(/\s+/).filter(Boolean).flatMap(t=>[t,...(near[t.toLowerCase()]||[])]);if(!terms.length)return;
+function jumpToHit(){const terms=query.replace(/["*]/g,' ').trim().split(/\s+/).filter(Boolean).flatMap(t=>[t,...(near[t.toLowerCase()]||[])]);if(!terms.length)return;
   const re=new RegExp(terms.map(t=>t.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')).join('|'),'gi'),nodes=[];
   const w=document.createTreeWalker($('body'),NodeFilter.SHOW_TEXT);while(w.nextNode()){if(!w.currentNode.parentElement.closest('details')&&!w.currentNode.parentElement.closest('time'))nodes.push(w.currentNode)}
   let first=null;for(const n of nodes){const v=n.nodeValue;re.lastIndex=0;if(!re.test(v))continue;re.lastIndex=0;
@@ -620,6 +665,8 @@ function jumpToHit(){const terms=query.trim().split(/\s+/).filter(Boolean).flatM
 
 let timer;$('q').addEventListener('input',e=>{clearTimeout(timer);timer=setTimeout(()=>{query=e.target.value;lastSig='';loadList()},250)});
 const fq=$('fq');
+try{$('sort').value=localStorage.getItem('sort')||'new'}catch(e){}
+$('sort').onchange=()=>{try{localStorage.setItem('sort',$('sort').value)}catch(e){}lastSig='';loadList()};
 fq.addEventListener('focus',()=>{fsel=0;showFolders();if(fq.classList.contains('set'))fq.select()});
 fq.addEventListener('input',()=>{fq.classList.remove('set');fsel=0;if(!fq.value&&folder){folder='';renderList();$('status').textContent=counts()}showFolders()});
 fq.addEventListener('blur',()=>setTimeout(()=>{$('fmenu').hidden=true;if(!fq.classList.contains('set'))fq.value=folder?home(folder):'';fq.classList.toggle('set',!!folder)},120));

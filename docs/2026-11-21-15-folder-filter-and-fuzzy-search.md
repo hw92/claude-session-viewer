@@ -27,4 +27,22 @@ Limits: a typo in the first letter is not caught (`ortune` does not find `fortun
 
 How it works: on startup, and after each rescan that finds changed files, the server reads every word in the index (about 94k words, under 1 s). A search with a misspelled word takes about 0.1-0.3 s.
 
+## Ranked search
+
+Search uses SQLite's full-text index (FTS5), so results are ranked and previews show where your words appear.
+
+| You type | Matches |
+|---|---|
+| `docker supabase` | Sessions with both words. A word also matches longer words that start with it (`sess` finds *session*, `art` finds *artifact* but not *start*) |
+| `"fortune alpha"` | The exact phrase, words next to each other |
+| `"art"` | Only the whole word *art* |
+| Chinese, Japanese or Korean text, e.g. `网球` | Exact substring search, the same as before. The word index can't split these languages into words |
+
+- **Sort:** when you search, a menu next to the result count switches between **Newest** (the default) and **Best match**; the viewer remembers your last choice. Best match ranks sessions that use your words more often first, and counts a match in the title 5 times as much as one in the text. Newest groups results by day.
+- **Previews:** the preview under each result shows the passage with your words highlighted.
+- **Fallback:** if word search finds nothing, the old substring search runs instead.
+- **Cap:** results stop at 300: the newest 300, or the best 300 under Best match.
+
+The word index adds about 18 MB to `~/.cache/cc-sessions/index.db` (40 MB → 58 MB) and is built in under 1 s on first start.
+
 *Written by Hai & Claude (claude-opus-5-5) | 2026-11-21 15:06 ET*
