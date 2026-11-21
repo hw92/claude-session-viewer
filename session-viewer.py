@@ -9,11 +9,12 @@ model sees; the original messages stay in the file, so this shows all of them.
     session-viewer --stop     stop the background server
 
 Set SV_RESUME_CMD to change the command in the resume button (default: claude).
+Set SV_TRASH to a folder to turn on the Move to trash button (off by default).
 
 Index with searchable text: ~/.cache/cc-sessions/index.db (safe to delete, rebuilt on start).
 Binds to 127.0.0.1 only. Python stdlib only.
 """
-import base64, bisect, collections, json, os, re, shlex, signal, sqlite3, subprocess, sys, threading, time, urllib.error, urllib.request, webbrowser
+import base64, bisect, collections, json, os, re, shlex, shutil, signal, sqlite3, subprocess, sys, threading, time, urllib.error, urllib.request, webbrowser
 from concurrent.futures import ProcessPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -25,6 +26,10 @@ DB = CACHE / "index.db"
 PID = CACHE / "server.pid"
 FAVS = Path.home() / ".claude/session-favorites.json"  # starred sessions; kept outside the disposable cache
 fav_lock = threading.Lock()
+# Delete button: off unless SV_TRASH names a folder. Deleting moves the session there, never removes it.
+TRASH = Path(os.path.expanduser(os.environ["SV_TRASH"])) if os.environ.get("SV_TRASH") else None
+SUMMARIES = Path.home() / ".claude/session-summaries.db"
+ACTIVE_SECONDS = 600  # refuse to delete a session changed this recently; Claude Code may still be writing it
 PORT = 8765
 WINDOWS = os.name == "nt"
 RESUME_CMD = os.environ.get("SV_RESUME_CMD", "claude")
@@ -405,6 +410,35 @@ def set_fav(key, on):
         return favs
 
 
+def trash_session(row):
+    """Move a session's jsonl and its sidecar folder (subagents, tool results) into TRASH/<date>-session-viewer/,
+    log it in TRASH/_manifest.md, and drop it from the index, favorites and summaries. Returns the new folder."""
+    src = Path(row["path"])
+    if time.time() - src.stat().st_mtime < ACTIVE_SECONDS:
+        raise ValueError("This session changed in the last 10 minutes and may still be running. Close it first.")
+    dest = TRASH / (time.strftime("%Y-%m-%d") + "-session-viewer")
+    dest.mkdir(parents=True, exist_ok=True)
+    name = f"{src.parent.name}__{src.stem}"
+    shutil.move(str(src), str(dest / (name + ".jsonl")))
+    side = src.with_suffix("")
+    if side.is_dir():
+        shutil.move(str(side), str(dest / name))
+    title = row["title"].replace("|", "/").replace("\n", " ")[:80]
+    with open(TRASH / "_manifest.md", "a") as f:
+        f.write(f"| {dest.name}/{name}.jsonl (session \"{title}\") | {src} | deleted in session viewer |\n")
+    con = connect()
+    con.execute("DELETE FROM sessions WHERE key=?", (row["key"],))
+    con.commit()
+    con.close()
+    set_fav(row["key"], False)
+    if SUMMARIES.exists():
+        con = sqlite3.connect(SUMMARIES, timeout=30)
+        con.execute("DELETE FROM summaries WHERE key=?", (row["key"],))
+        con.commit()
+        con.close()
+    return str(dest).replace(str(Path.home()), "~", 1)
+
+
 def resume_line(cwd, sid):
     if WINDOWS:  # PowerShell, the Windows Terminal default
         return f"cd '{cwd.replace(chr(39), chr(39) * 2)}'; {RESUME_CMD} --resume {sid}"
@@ -437,8 +471,14 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(b"forbidden", "text/plain", 403)
         try:
             body = json.loads(self.rfile.read(min(int(self.headers.get("Content-Length") or 0), 10000)) or b"{}")
-            if urlparse(self.path).path == "/api/fav" and lookup(str(body.get("key", ""))):
+            path, row = urlparse(self.path).path, lookup(str(body.get("key", "")))
+            if path == "/api/fav" and row:
                 return self.json({"favs": set_fav(body["key"], bool(body.get("on")))})
+            if path == "/api/delete" and row and TRASH:
+                try:
+                    return self.json({"moved_to": trash_session(row)})
+                except (ValueError, OSError) as e:
+                    return self.json({"error": str(e)})
             self.send(b"not found", "text/plain", 404)
         except (ValueError, AttributeError):
             self.send(b"bad request", "text/plain", 400)
@@ -453,7 +493,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(PAGE.encode(), "text/html; charset=utf-8")
             if url.path == "/api/sessions":
                 rows, near = list_sessions(qs.get("q", ""), qs.get("sort", "new"))
-                return self.json({"sessions": rows, "fuzzy": near, "favs": load_favs(), "progress": progress})
+                return self.json({"sessions": rows, "fuzzy": near, "favs": load_favs(), "can_delete": bool(TRASH),
+                                  "progress": progress})
             row = lookup(qs.get("key", ""))
             if not row:
                 return self.send(b"not found", "text/plain", 404)
@@ -554,6 +595,7 @@ input:focus,select:focus{outline:2px solid var(--accent);outline-offset:-1px}
 .day{position:sticky;top:0;background:var(--panel);padding:10px 12px 4px;font-size:12px;font-weight:600;color:var(--dim);z-index:1}
 .row{display:block;width:100%;text-align:left;border:0;background:none;color:inherit;font:inherit;padding:7px 12px;cursor:pointer;border-left:3px solid transparent}
 .row:hover{background:var(--sel)}.row.on{background:var(--sel);border-left-color:var(--accent)}
+.b.del{margin-left:auto}.b.del.armed{color:#fff;background:#c0392b;border-color:#c0392b}
 .row .star{color:var(--accent);margin-right:4px}#favbtn.on{border-color:var(--accent);color:var(--accent);font-weight:600}
 #srow .b{flex:none}.b.fav{color:var(--accent);border-color:var(--accent)}
 .row b{display:block;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -629,15 +671,23 @@ async function loadList(){
   const r=await(await fetch('/api/sessions?q='+encodeURIComponent(query)+'&sort='+$('sort').value)).json();$('sort').hidden=!query.trim();
   const sig=r.sessions.map(s=>s.key+s.last+s.title).join();
   if(sig!==lastSig){lastSig=sig;all=r.sessions;fillFolders();renderList()}
-  near=r.fuzzy||{};if(JSON.stringify(r.favs)!==JSON.stringify(favs)){favs=r.favs||{};renderList();starBtn()}const p=r.progress;$('status').textContent=(p.running?`Indexing ${p.done} of ${p.total} changed files. `:'')+counts();
+  near=r.fuzzy||{};canDelete=r.can_delete;if(JSON.stringify(r.favs)!==JSON.stringify(favs)){favs=r.favs||{};renderList();starBtn()}const p=r.progress;$('status').textContent=(p.running?`Indexing ${p.done} of ${p.total} changed files. `:'')+counts();
   clearTimeout(loadList.t);loadList.t=setTimeout(loadList,p.running?2000:30000)}
 let folder='',folders=[],fpick=[],fsel=0;
-let favs={},favOnly=false;try{favOnly=localStorage.getItem('favOnly')==='1'}catch(e){}
+let favs={},favOnly=false,canDelete=false;try{favOnly=localStorage.getItem('favOnly')==='1'}catch(e){}
 function visible(){return all.filter(s=>(!folder||s.cwd===folder)&&(!favOnly||favs[s.key]))}
 function setFavOnly(on){favOnly=on;try{localStorage.setItem('favOnly',on?'1':'0')}catch(e){}renderList();$('status').textContent=counts();$('list').scrollTop=0}
 function favLabel(){const n=Object.keys(favs).length;$('favbtn').textContent=(favOnly?'★':'☆')+' Favorites'+(n?` (${n})`:'');$('favbtn').classList.toggle('on',favOnly)}
 async function toggleFav(key){const r=await fetch('/api/fav',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key,on:!favs[key]})});
   if(!r.ok)return;favs=(await r.json()).favs;renderList();$('status').textContent=counts();starBtn()}
+// Two clicks: the first arms the button for 4 seconds, the second moves the session to the trash folder.
+function deleteBtn(key){const b=document.createElement('button');b.className='b del';b.textContent='Move to trash';
+  b.onclick=async()=>{if(!b.armed){b.armed=1;b.textContent='Click again to confirm';b.classList.add('armed');
+      setTimeout(()=>{b.armed=0;b.textContent='Move to trash';b.classList.remove('armed')},4000);return}
+    b.disabled=true;const r=await(await fetch('/api/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key})})).json();
+    if(r.error){b.textContent=r.error;return}
+    all=all.filter(x=>x.key!==key);delete favs[key];currentKey=null;history.replaceState(null,'',location.pathname);renderList();$('status').textContent=counts();
+    $('head').hidden=true;$('outline').innerHTML='';$('body').innerHTML=`<div class="empty">Moved to ${esc(r.moved_to)}. Move it back to ~/.claude/projects to restore it.</div>`};return b}
 function starBtn(){const b=$('head').querySelector('.star-btn');if(!b)return;const on=!!favs[currentKey];b.textContent=on?'★ Favorited':'☆ Favorite';b.classList.toggle('fav',on)}
 function counts(){const v=visible(),n=v.length,f=Object.entries(near).map(([t,w])=>`${t} → ${w.join(', ')}`).join('; ');
   return `${n}${query&&n===300?'+':''} session${n===1?'':'s'}${query?' match':''}${f?'. Also matching '+f:''}`}
@@ -675,6 +725,7 @@ async function openSession(key){currentKey=key;renderList();
   $('head').innerHTML=`<h1>${esc(s.title)}</h1><p><span class="cwd" title="Show only this folder">${esc(home(s.cwd))}</span> · ${esc(span)} · ${s.users} prompts · ${s.compacts} compactions · ${(s.size/1048576).toFixed(1)} MB</p><div class="btns"></div>`;
   const star=document.createElement('button');star.className='b star-btn';star.onclick=()=>toggleFav(key);
   $('head').querySelector('.btns').append(star,copyBtn('Copy resume command',s.resume),copyBtn('Copy jsonl path',s.path));starBtn();
+  if(canDelete)$('head').querySelector('.btns').append(deleteBtn(key));
   $('head').querySelector('.cwd').onclick=()=>setFolder(s.cwd);
   $('head').hidden=false;renderBody(s,items);$('main').scrollTop=0;jumpToHit()}
 function renderBody(s,items){const body=$('body'),out=[];body.innerHTML='';let day='',group=null,n=0;

@@ -3,7 +3,7 @@
 Browse and search every Claude Code session on your computer, in your browser. Includes messages from before compaction, which you can no longer scroll back to in the terminal.
 
 - One Python file, no dependencies, no build step
-- Read-only: it never changes your session files
+- Read-only by default: it never changes your session files unless you turn on the trash button (below)
 - Local-only: it listens on `127.0.0.1` and makes no network calls
 
 ## Requirements
@@ -31,6 +31,10 @@ Your browser opens at http://127.0.0.1:8765/. The viewer keeps running in the ba
 ## Custom install
 
 To choose the folder, add a short command like `sv`, or change the resume button, see [CUSTOM-INSTALL.md](CUSTOM-INSTALL.md). You can follow it yourself or ask your Claude Code agent to do it for you.
+
+## Moving sessions to trash
+
+Set `SV_TRASH` to a folder before starting the viewer, e.g. `export SV_TRASH=~/trash-box`. Each session then gets a **Move to trash** button (click twice to confirm). It moves the session file and its subagent folder into `<SV_TRASH>/<date>-session-viewer/`, adds a line to `<SV_TRASH>/_manifest.md`, and never deletes anything. It refuses sessions changed in the last 10 minutes. To restore one, move it back to `~/.claude/projects/<folder>/`.
 
 ## Privacy
 

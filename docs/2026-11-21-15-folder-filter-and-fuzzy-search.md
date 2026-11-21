@@ -49,4 +49,8 @@ The word index adds about 18 MB to `~/.cache/cc-sessions/index.db` (40 MB → 58
 
 Open a session and click **☆ Favorite** in its header to star it; starred sessions show ★ in the list. The **☆ Favorites** button under the search box shows only starred sessions; it combines with search and the folder filter, and the viewer remembers whether it is on. Stars are saved in `~/.claude/session-favorites.json`, outside the disposable index. Only the viewer page itself can change them: the server refuses writes from other sites.
 
+## Move to trash
+
+With `SV_TRASH` set (here `~/trash-box`, set in `~/.zshrc`), each session header has **Move to trash**. Click it, then click again within 4 seconds to confirm. The session's `.jsonl` and its subagent folder move to `~/trash-box/<date>-session-viewer/`, a row is added to `~/trash-box/_manifest.md`, and the session leaves the index, favorites and summaries. Sessions changed in the last 10 minutes are refused, since Claude Code may still be writing them.
+
 *Written by Hai & Claude (claude-opus-5-5) | 2026-11-21 15:06 ET*
