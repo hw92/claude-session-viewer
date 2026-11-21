@@ -45,4 +45,8 @@ Search uses SQLite's full-text index (FTS5), so results are ranked and previews 
 
 The word index adds about 18 MB to `~/.cache/cc-sessions/index.db` (40 MB → 58 MB) and is built in under 1 s on first start.
 
+## Favorites
+
+Open a session and click **☆ Favorite** in its header to star it; starred sessions show ★ in the list. The **☆ Favorites** button under the search box shows only starred sessions; it combines with search and the folder filter, and the viewer remembers whether it is on. Stars are saved in `~/.claude/session-favorites.json`, outside the disposable index. Only the viewer page itself can change them: the server refuses writes from other sites.
+
 *Written by Hai & Claude (claude-opus-5-5) | 2026-11-21 15:06 ET*

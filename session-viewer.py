@@ -23,6 +23,8 @@ PROJECTS = Path.home() / ".claude/projects"
 CACHE = Path.home() / ".cache/cc-sessions"
 DB = CACHE / "index.db"
 PID = CACHE / "server.pid"
+FAVS = Path.home() / ".claude/session-favorites.json"  # starred sessions; kept outside the disposable cache
+fav_lock = threading.Lock()
 PORT = 8765
 WINDOWS = os.name == "nt"
 RESUME_CMD = os.environ.get("SV_RESUME_CMD", "claude")
@@ -382,6 +384,27 @@ def lookup(key):
     return dict(row) if row else None
 
 
+def load_favs():
+    try:
+        return json.loads(FAVS.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def set_fav(key, on):
+    """Star or unstar one session; returns the starred keys."""
+    with fav_lock:
+        favs = load_favs()
+        if on:
+            favs.setdefault(key, time.strftime("%Y-%m-%dT%H:%M:%S"))
+        else:
+            favs.pop(key, None)
+        tmp = FAVS.with_suffix(".tmp")
+        tmp.write_text(json.dumps(favs, indent=1))
+        tmp.replace(FAVS)
+        return favs
+
+
 def resume_line(cwd, sid):
     if WINDOWS:  # PowerShell, the Windows Terminal default
         return f"cd '{cwd.replace(chr(39), chr(39) * 2)}'; {RESUME_CMD} --resume {sid}"
@@ -403,9 +426,25 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def do_GET(self):
+    def local(self):
         # Reject other hostnames so a web page cannot read this through DNS rebinding.
-        if self.headers.get("Host") not in (f"127.0.0.1:{PORT}", f"localhost:{PORT}"):
+        return self.headers.get("Host") in (f"127.0.0.1:{PORT}", f"localhost:{PORT}")
+
+    def do_POST(self):
+        # Writes must come from this page: same host, same origin, JSON body (other sites cannot send that without a preflight).
+        if not self.local() or self.headers.get("Origin") not in (f"http://127.0.0.1:{PORT}", f"http://localhost:{PORT}") \
+                or not (self.headers.get("Content-Type") or "").startswith("application/json"):
+            return self.send(b"forbidden", "text/plain", 403)
+        try:
+            body = json.loads(self.rfile.read(min(int(self.headers.get("Content-Length") or 0), 10000)) or b"{}")
+            if urlparse(self.path).path == "/api/fav" and lookup(str(body.get("key", ""))):
+                return self.json({"favs": set_fav(body["key"], bool(body.get("on")))})
+            self.send(b"not found", "text/plain", 404)
+        except (ValueError, AttributeError):
+            self.send(b"bad request", "text/plain", 400)
+
+    def do_GET(self):
+        if not self.local():
             return self.send(b"forbidden", "text/plain", 403)
         url = urlparse(self.path)
         qs = {k: v[0] for k, v in parse_qs(url.query).items()}
@@ -414,7 +453,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(PAGE.encode(), "text/html; charset=utf-8")
             if url.path == "/api/sessions":
                 rows, near = list_sessions(qs.get("q", ""), qs.get("sort", "new"))
-                return self.json({"sessions": rows, "fuzzy": near, "progress": progress})
+                return self.json({"sessions": rows, "fuzzy": near, "favs": load_favs(), "progress": progress})
             row = lookup(qs.get("key", ""))
             if not row:
                 return self.send(b"not found", "text/plain", 404)
@@ -515,6 +554,8 @@ input:focus,select:focus{outline:2px solid var(--accent);outline-offset:-1px}
 .day{position:sticky;top:0;background:var(--panel);padding:10px 12px 4px;font-size:12px;font-weight:600;color:var(--dim);z-index:1}
 .row{display:block;width:100%;text-align:left;border:0;background:none;color:inherit;font:inherit;padding:7px 12px;cursor:pointer;border-left:3px solid transparent}
 .row:hover{background:var(--sel)}.row.on{background:var(--sel);border-left-color:var(--accent)}
+.row .star{color:var(--accent);margin-right:4px}#favbtn.on{border-color:var(--accent);color:var(--accent);font-weight:600}
+#srow .b{flex:none}.b.fav{color:var(--accent);border-color:var(--accent)}
 .row b{display:block;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .row small{display:block;color:var(--dim);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .row .snip{white-space:normal;margin-top:2px;color:var(--ink);opacity:.8}
@@ -546,7 +587,7 @@ details.one label{display:block;margin:6px 0 2px;font-size:11px;font-weight:600}
 </style></head><body>
 <aside id="left"><div id="controls">
 <input id="q" type="search" placeholder="Search all sessions  ( / )" autocomplete="off">
-<div id="fbox"><input id="fq" type="search" placeholder="Filter by folder  ( f )" autocomplete="off" spellcheck="false"><div id="fmenu" hidden></div></div><div id="srow"><div id="status"></div><select id="sort" title="Order of search results" hidden><option value="new">Newest</option><option value="rank">Best match</option></select></div></div><div id="list"></div></aside>
+<div id="fbox"><input id="fq" type="search" placeholder="Filter by folder  ( f )" autocomplete="off" spellcheck="false"><div id="fmenu" hidden></div></div><div id="srow"><button id="favbtn" class="b" title="Show only starred sessions">☆ Favorites</button><div id="status"></div><select id="sort" title="Order of search results" hidden><option value="new">Newest</option><option value="rank">Best match</option></select></div></div><div id="list"></div></aside>
 <main id="main"><div id="head" hidden></div><div id="body"><div class="empty">Pick a session on the left.</div></div></main>
 <aside id="outline"></aside>
 <script>
@@ -588,10 +629,16 @@ async function loadList(){
   const r=await(await fetch('/api/sessions?q='+encodeURIComponent(query)+'&sort='+$('sort').value)).json();$('sort').hidden=!query.trim();
   const sig=r.sessions.map(s=>s.key+s.last+s.title).join();
   if(sig!==lastSig){lastSig=sig;all=r.sessions;fillFolders();renderList()}
-  near=r.fuzzy||{};const p=r.progress;$('status').textContent=(p.running?`Indexing ${p.done} of ${p.total} changed files. `:'')+counts();
+  near=r.fuzzy||{};if(JSON.stringify(r.favs)!==JSON.stringify(favs)){favs=r.favs||{};renderList();starBtn()}const p=r.progress;$('status').textContent=(p.running?`Indexing ${p.done} of ${p.total} changed files. `:'')+counts();
   clearTimeout(loadList.t);loadList.t=setTimeout(loadList,p.running?2000:30000)}
 let folder='',folders=[],fpick=[],fsel=0;
-function visible(){return folder?all.filter(s=>s.cwd===folder):all}
+let favs={},favOnly=false;try{favOnly=localStorage.getItem('favOnly')==='1'}catch(e){}
+function visible(){return all.filter(s=>(!folder||s.cwd===folder)&&(!favOnly||favs[s.key]))}
+function setFavOnly(on){favOnly=on;try{localStorage.setItem('favOnly',on?'1':'0')}catch(e){}renderList();$('status').textContent=counts();$('list').scrollTop=0}
+function favLabel(){const n=Object.keys(favs).length;$('favbtn').textContent=(favOnly?'★':'☆')+' Favorites'+(n?` (${n})`:'');$('favbtn').classList.toggle('on',favOnly)}
+async function toggleFav(key){const r=await fetch('/api/fav',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key,on:!favs[key]})});
+  if(!r.ok)return;favs=(await r.json()).favs;renderList();$('status').textContent=counts();starBtn()}
+function starBtn(){const b=$('head').querySelector('.star-btn');if(!b)return;const on=!!favs[currentKey];b.textContent=on?'★ Favorited':'☆ Favorite';b.classList.toggle('fav',on)}
 function counts(){const v=visible(),n=v.length,f=Object.entries(near).map(([t,w])=>`${t} → ${w.join(', ')}`).join('; ');
   return `${n}${query&&n===300?'+':''} session${n===1?'':'s'}${query?' match':''}${f?'. Also matching '+f:''}`}
 function fillFolders(){const c={};for(const s of all){const f=c[s.cwd]||(c[s.cwd]={cwd:s.cwd,n:0,last:''});f.n++;if(s.last>f.last)f.last=s.last}
@@ -607,11 +654,11 @@ function showFolders(){const typed=$('fq').classList.contains('set')?'':$('fq').
 const base=p=>(p||'').split(/[\\/]/).filter(Boolean).pop()||p;
 function setFolder(cwd){folder=cwd||'';const q=$('fq');q.value=folder?home(folder):'';q.classList.toggle('set',!!folder);q.title=folder;
   $('fmenu').hidden=true;renderList();$('status').textContent=counts();$('list').scrollTop=0}
-function renderList(){let h='',day='';const ranked=query.trim()&&$('sort').value==='rank';
+function renderList(){let h='',day='';favLabel();const ranked=query.trim()&&$('sort').value==='rank';
   for(const s of visible()){const d=dayName(s.last);if(!ranked&&d!==day){day=d;h+=`<div class="day">${esc(d)}</div>`}
     const c=s.compacts?` · compacted ${s.compacts}x`:'';
-    h+=`<button class="row${s.key===currentKey?' on':''}" data-k="${esc(s.key)}"><b>${esc(s.title)}</b><small>${esc(clock(s.last))} · ${esc(home(s.cwd))} · ${s.users} prompts${c}</small>${s.snippet?`<small class="snip">${esc(s.snippet.replace(/\s+/g,' ')).replace(/\x02/g,'<mark>').replace(/\x03/g,'</mark>')}</small>`:''}</button>`}
-  $('list').innerHTML=h||'<div class="empty">No sessions.</div>';
+    h+=`<button class="row${s.key===currentKey?' on':''}" data-k="${esc(s.key)}"><b>${favs[s.key]?'<span class="star">★</span>':''}${esc(s.title)}</b><small>${esc(clock(s.last))} · ${esc(home(s.cwd))} · ${s.users} prompts${c}</small>${s.snippet?`<small class="snip">${esc(s.snippet.replace(/\s+/g,' ')).replace(/\x02/g,'<mark>').replace(/\x03/g,'</mark>')}</small>`:''}</button>`}
+  $('list').innerHTML=h||`<div class="empty">${favOnly&&!Object.keys(favs).length?'No favorites yet. Open a session and click ☆ Favorite.':'No sessions.'}</div>`;
   $('list').querySelectorAll('.row').forEach(b=>b.onclick=()=>{if(b.dataset.k===currentKey)openSession(currentKey);else location.hash=encodeURIComponent(b.dataset.k)})}
 
 function copyBtn(label,value){const b=document.createElement('button');b.className='b';b.textContent=label;
@@ -626,7 +673,8 @@ async function openSession(key){currentKey=key;renderList();
   const zone=new Intl.DateTimeFormat('en-US',{timeZoneName:'short'}).formatToParts(new Date(s.last)).find(x=>x.type==='timeZoneName').value;
   const span=`${clock(s.first)} to ${clock(s.last)} ${zone}`;
   $('head').innerHTML=`<h1>${esc(s.title)}</h1><p><span class="cwd" title="Show only this folder">${esc(home(s.cwd))}</span> · ${esc(span)} · ${s.users} prompts · ${s.compacts} compactions · ${(s.size/1048576).toFixed(1)} MB</p><div class="btns"></div>`;
-  $('head').querySelector('.btns').append(copyBtn('Copy resume command',s.resume),copyBtn('Copy jsonl path',s.path));
+  const star=document.createElement('button');star.className='b star-btn';star.onclick=()=>toggleFav(key);
+  $('head').querySelector('.btns').append(star,copyBtn('Copy resume command',s.resume),copyBtn('Copy jsonl path',s.path));starBtn();
   $('head').querySelector('.cwd').onclick=()=>setFolder(s.cwd);
   $('head').hidden=false;renderBody(s,items);$('main').scrollTop=0;jumpToHit()}
 function renderBody(s,items){const body=$('body'),out=[];body.innerHTML='';let day='',group=null,n=0;
@@ -666,6 +714,7 @@ function jumpToHit(){const terms=query.replace(/["*]/g,' ').trim().split(/\s+/).
 let timer;$('q').addEventListener('input',e=>{clearTimeout(timer);timer=setTimeout(()=>{query=e.target.value;lastSig='';loadList()},250)});
 const fq=$('fq');
 try{$('sort').value=localStorage.getItem('sort')||'new'}catch(e){}
+$('favbtn').onclick=()=>setFavOnly(!favOnly);
 $('sort').onchange=()=>{try{localStorage.setItem('sort',$('sort').value)}catch(e){}lastSig='';loadList()};
 fq.addEventListener('focus',()=>{fsel=0;showFolders();if(fq.classList.contains('set'))fq.select()});
 fq.addEventListener('input',()=>{fq.classList.remove('set');fsel=0;if(!fq.value&&folder){folder='';renderList();$('status').textContent=counts()}showFolders()});
